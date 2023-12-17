@@ -1,14 +1,14 @@
 import express, { Response } from 'express';
 import bodyParser from 'body-parser';
 
-import axios from 'axios';
-
 import { Browser } from 'puppeteer';
 import puppeteer from 'puppeteer-extra';
+import UserAgent from 'user-agents';
 import StealthPlugin from 'puppeteer-extra-plugin-stealth';
 import AdblockerPlugin from 'puppeteer-extra-plugin-adblocker';
 
-import UserAgent from 'user-agents';
+import axios from 'axios';
+import sharp from 'sharp';
 
 puppeteer.use(StealthPlugin());
 puppeteer.use(AdblockerPlugin({ blockTrackers: true }));
@@ -61,6 +61,7 @@ class BrowserManager {
 			const url = this.urlQueue.shift();
 			let response: any = {
 				url: url,
+				images: [],
 			};
 
 			// if amazon link
@@ -183,6 +184,7 @@ class BrowserManager {
 									index++;
 								}
 							}
+
 							response.images = response.images.concat(imgSrcs);
 						} catch (e) {}
 
@@ -253,12 +255,6 @@ app.listen(port, () => {
 
 const delay = (ms) => new Promise((res) => setTimeout(res, ms));
 
-function replaceImageURL(url: string) {
-	const regexPattern = /(_AC.+\.jpg)/;
-	const replacedURL = url.replace(regexPattern, 'AC_SL1500_.jpg');
-	return replacedURL;
-}
-
 async function getPageCount() {
 	if (browserManager.browser !== undefined) {
 		const pages = await browserManager.browser.pages();
@@ -291,17 +287,29 @@ async function autoScroll(page, maxScrolls) {
 }
 
 async function getImageAsBase64(imageUrl: string): Promise<string> {
-	const userAgent = new UserAgent({ deviceCategory: 'desktop' });
-	const randomUserAgent = userAgent.toString();
+	return new Promise(async (resolve, reject) => {
+		const userAgent = new UserAgent({ deviceCategory: 'desktop' });
+		const randomUserAgent = userAgent.toString();
 
-	const response = await axios.get(imageUrl, {
-		responseType: 'arraybuffer',
-		headers: {
-			'User-Agent': randomUserAgent,
-		},
-	});
+		const response = await axios.get(imageUrl, {
+			responseType: 'arraybuffer',
+			headers: {
+				'User-Agent': randomUserAgent,
+			},
+		});
 
-	return new Promise((resolve, reject) => {
-		resolve(`data:${response.headers['content-type']};base64,${Buffer.from(response.data, 'binary').toString('base64')}`);
+		// load image and remove transparency
+		let resizedImageBuf = await sharp(response.data);
+		resizedImageBuf = await resizedImageBuf.flatten({ background: { r: 255, g: 255, b: 255 } });
+
+		// resize if larger than 1000px in any direction
+		const metadata = await resizedImageBuf.metadata();
+		if (metadata.height > 1000 || metadata.width > 1000) {
+			resizedImageBuf = resizedImageBuf.resize(1000);
+		}
+
+		// convert to base64
+		const base64 = (await resizedImageBuf.toBuffer()).toString('base64');
+		resolve(`data:image/jpg;base64,${base64}`);
 	});
 }
