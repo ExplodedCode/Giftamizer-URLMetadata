@@ -9,6 +9,7 @@ import AdblockerPlugin from 'puppeteer-extra-plugin-adblocker';
 
 import axios from 'axios';
 import sharp from 'sharp';
+import UI from './UI';
 
 puppeteer.use(StealthPlugin());
 puppeteer.use(AdblockerPlugin({ blockTrackers: true }));
@@ -25,7 +26,7 @@ class BrowserManager {
 		this.browser = await puppeteer.launch({
 			// headless: false,
 			headless: 'new',
-			args: ['--no-sandbox', '--disable-setuid-sandbox', '--window-size=1600,900'],
+			args: ['--no-sandbox', '--disable-setuid-sandbox', '--window-size=1600,1200'],
 		});
 		console.log('Browser launched');
 	}
@@ -38,24 +39,14 @@ class BrowserManager {
 		// initialize page
 		const page = await this.browser.newPage();
 		await page.setViewport({
-			width: 1000,
-			height: 750,
+			width: 1600,
+			height: 1200,
 		});
 
 		// generate random User Agent
 		const userAgent = new UserAgent({ deviceCategory: 'desktop' });
 		const randomUserAgent = userAgent.toString();
 		await page.setUserAgent(randomUserAgent);
-
-		// Blocking image requests
-		// await page.setRequestInterception(true);
-		// page.on('request', (request) => {
-		// 	if (request.resourceType() === 'image') {
-		// 		request.abort();
-		// 	} else {
-		// 		request.continue();
-		// 	}
-		// });
 
 		if (this.urlQueue.length > 0) {
 			const url = this.urlQueue.shift();
@@ -101,7 +92,9 @@ class BrowserManager {
 						let imagesBase64 = [];
 						for (let index = 0; index < response.images.length; index++) {
 							const img = response.images[index];
-							imagesBase64.push(await getImageAsBase64(img));
+							try {
+								imagesBase64.push(await getImageAsBase64(img));
+							} catch (e) {}
 						}
 						response.images = imagesBase64;
 					} catch (e) {}
@@ -123,7 +116,7 @@ class BrowserManager {
 					res.send(response);
 				} catch (error) {
 					console.log(error);
-					res.status(400).send('Product not found');
+					res.status(400).send({ error: 'Product not found' });
 				}
 			} else {
 				try {
@@ -160,7 +153,7 @@ class BrowserManager {
 						const content = await page.$eval('body', (element) => {
 							return element.innerText;
 						});
-						response.price = /\$(\s+?)?\d+(.\d{1,2})/.exec(content)?.[0];
+						response.price = /\$(\s+?)?\d+(.\d{1,2})/.exec(content)?.[0].replace('$ ', '$');
 					} catch (e) {}
 
 					// get first image
@@ -192,14 +185,24 @@ class BrowserManager {
 						let imagesBase64 = [];
 						for (let index = 0; index < response.images.length; index++) {
 							const img = response.images[index];
-							imagesBase64.push(await getImageAsBase64(img));
+							try {
+								imagesBase64.push(await getImageAsBase64(img));
+							} catch (e) {}
 						}
 						response.images = imagesBase64;
 					} catch (e) {}
 
 					// append page screenshot to the end
-					const screenshot = await page.screenshot({ encoding: 'base64' });
-					response.images = response.images.concat('data:image/jpeg;base64,' + screenshot);
+					const screenshot = await page.screenshot();
+					let resizedImageBuf = await sharp(screenshot);
+					// resize if larger than 1000px in any direction
+					const metadata = await resizedImageBuf.metadata();
+					if (metadata.height > 1000 || metadata.width > 1000) {
+						resizedImageBuf = resizedImageBuf.resize(1000);
+					}
+					// convert to base64
+					const base64 = (await resizedImageBuf.toBuffer()).toString('base64');
+					response.images = response.images.concat('data:image/jpeg;base64,' + base64);
 
 					// remove duplicates
 					response.images = response.images.filter(function (item: any, pos: number) {
@@ -213,7 +216,7 @@ class BrowserManager {
 					res.send(response);
 				} catch (error) {
 					console.log(error);
-					res.status(400).send('Product not found');
+					res.status(400).send({ error: 'Product not found' });
 				}
 			}
 		}
@@ -237,8 +240,20 @@ app.post('/', async (req, res) => {
 			if (url.length > 0 && url.startsWith('http')) {
 				browserManager.enqueue(url, res);
 			} else {
-				res.status(400).send('No url provided');
+				res.status(400).send({ error: 'No url provided' });
 			}
+		}
+	} catch (error) {
+		res.status(500).send('ERROR! - ' + error.message);
+	}
+});
+
+app.get('/', async (req, res) => {
+	try {
+		if (browserManager.browser === undefined) {
+			res.status(500).send('Server initializing...');
+		} else {
+			res.send(UI);
 		}
 	} catch (error) {
 		res.status(500).send('ERROR! - ' + error.message);
@@ -288,28 +303,33 @@ async function autoScroll(page, maxScrolls) {
 
 async function getImageAsBase64(imageUrl: string): Promise<string> {
 	return new Promise(async (resolve, reject) => {
-		const userAgent = new UserAgent({ deviceCategory: 'desktop' });
-		const randomUserAgent = userAgent.toString();
+		try {
+			const userAgent = new UserAgent({ deviceCategory: 'desktop' });
+			const randomUserAgent = userAgent.toString();
 
-		const response = await axios.get(imageUrl, {
-			responseType: 'arraybuffer',
-			headers: {
-				'User-Agent': randomUserAgent,
-			},
-		});
+			const response = await axios.get(imageUrl, {
+				responseType: 'arraybuffer',
+				headers: {
+					'User-Agent': randomUserAgent,
+				},
+			});
 
-		// load image and remove transparency
-		let resizedImageBuf = await sharp(response.data);
-		resizedImageBuf = await resizedImageBuf.flatten({ background: { r: 255, g: 255, b: 255 } });
+			// load image and remove transparency
+			let resizedImageBuf = await sharp(response.data);
+			resizedImageBuf = await resizedImageBuf.flatten({ background: { r: 255, g: 255, b: 255 } });
 
-		// resize if larger than 1000px in any direction
-		const metadata = await resizedImageBuf.metadata();
-		if (metadata.height > 1000 || metadata.width > 1000) {
-			resizedImageBuf = resizedImageBuf.resize(1000);
+			// resize if larger than 1000px in any direction
+			const metadata = await resizedImageBuf.metadata();
+			if (metadata.height > 1000 || metadata.width > 1000) {
+				resizedImageBuf = resizedImageBuf.resize(1000);
+			}
+
+			// convert to base64
+			const base64 = (await resizedImageBuf.toBuffer()).toString('base64');
+			resolve(`data:image/jpg;base64,${base64}`);
+		} catch (error) {
+			console.log(`Error: ${imageUrl}`, error);
+			reject(error);
 		}
-
-		// convert to base64
-		const base64 = (await resizedImageBuf.toBuffer()).toString('base64');
-		resolve(`data:image/jpg;base64,${base64}`);
 	});
 }
