@@ -34,7 +34,7 @@ const html = `<!DOCTYPE html>
     <div class="container py-5">
         <h1 class="mb-4">Enter a URL to Fetch</h1>
         <div class="form-outline mb-4">
-            <input type="text" id="urlInput" class="form-control" placeholder="Enter URL here" />
+            <input type="text" id="urlInput" class="form-control" placeholder="Enter URL here" value="https://picsum.photos" />
         </div>
         <button onclick="fetchData()" class="btn btn-primary btn-lg mb-3">Send</button>
         <div id="loading" class="loading-spinner" style="display: none;"></div>

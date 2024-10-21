@@ -6,6 +6,7 @@ WORKDIR /app
 COPY package.json package.json
 COPY tsconfig.json tsconfig.json
 COPY index.ts index.ts
+COPY UI.ts UI.ts
 
 # install deps
 RUN npm install

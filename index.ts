@@ -3,15 +3,18 @@ import bodyParser from 'body-parser';
 
 import { Browser } from 'puppeteer';
 import puppeteer from 'puppeteer-extra';
-import UserAgent from 'user-agents';
-import StealthPlugin from 'puppeteer-extra-plugin-stealth';
+import createPuppeteerStealth from 'puppeteer-extra-plugin-stealth';
 import AdblockerPlugin from 'puppeteer-extra-plugin-adblocker';
+
+import UserAgent from 'user-agents';
 
 import axios from 'axios';
 import sharp from 'sharp';
 import UI from './UI';
 
-puppeteer.use(StealthPlugin());
+const puppeteerStealth = createPuppeteerStealth();
+puppeteerStealth.enabledEvasions.delete('user-agent-override');
+puppeteer.use(puppeteerStealth);
 puppeteer.use(AdblockerPlugin({ blockTrackers: true }));
 
 class BrowserManager {
@@ -43,11 +46,6 @@ class BrowserManager {
 			height: 1200,
 		});
 
-		// generate random User Agent
-		const userAgent = new UserAgent({ deviceCategory: 'desktop' });
-		const randomUserAgent = userAgent.toString();
-		await page.setUserAgent(randomUserAgent);
-
 		if (this.urlQueue.length > 0) {
 			const url = this.urlQueue.shift();
 			let response: any = {
@@ -64,6 +62,11 @@ class BrowserManager {
 					// get title
 					try {
 						response.title = (await page.$eval('#productTitle', (element) => element.innerHTML)).trim();
+					} catch (e) {}
+
+					// get description
+					try {
+						response.description = (await page.$eval('#productDescription', (element) => element.innerHTML)).trim();
 					} catch (e) {}
 
 					// get price
