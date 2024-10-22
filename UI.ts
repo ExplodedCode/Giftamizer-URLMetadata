@@ -78,7 +78,7 @@ const html = `<!DOCTYPE html>
                     
                     imagesDiv.innerHTML = ''; // Clear previous images
                     data.images.forEach(img => {
-                        imagesDiv.innerHTML += \`<img src="\${img}" width="200" height="200" />\`;
+                        imagesDiv.innerHTML += \`<img src="\${img}" style="max-width: 200px; max-height: 200px;" />\`;
                     });
                     console.log('Data:', data);
                 } catch (e) {

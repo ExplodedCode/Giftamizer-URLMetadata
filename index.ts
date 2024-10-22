@@ -1,10 +1,10 @@
 import express, { Response } from 'express';
 import bodyParser from 'body-parser';
 
-import { Browser } from 'puppeteer';
 import puppeteer from 'puppeteer-extra';
 import createPuppeteerStealth from 'puppeteer-extra-plugin-stealth';
-import AdblockerPlugin from 'puppeteer-extra-plugin-adblocker';
+import { PuppeteerBlocker } from '@ghostery/adblocker-puppeteer';
+import fetch from 'cross-fetch'; // required for PuppeteerBlocker
 
 import UserAgent from 'user-agents';
 
@@ -15,32 +15,27 @@ import UI from './UI';
 const puppeteerStealth = createPuppeteerStealth();
 puppeteerStealth.enabledEvasions.delete('user-agent-override');
 puppeteer.use(puppeteerStealth);
-puppeteer.use(AdblockerPlugin({ blockTrackers: true }));
 
 class BrowserManager {
-	browser: Browser;
 	urlQueue: string[] = [];
-
-	constructor() {
-		this.launchBrowser();
-	}
-
-	async launchBrowser() {
-		this.browser = await puppeteer.launch({
-			// headless: false,
-			headless: 'new',
-			args: ['--no-sandbox', '--disable-setuid-sandbox', '--window-size=1600,1200'],
-		});
-		console.log('Browser launched');
-	}
 
 	async enqueue(url: string, res: Response) {
 		this.urlQueue.push(url);
 
 		console.log('Load images for... ' + url);
 
+		const browser = await puppeteer.launch({
+			// headless: false,
+			args: ['--no-sandbox', '--disable-setuid-sandbox', '--window-size=1600,1200'],
+		});
+		console.log('Browser launched');
+
 		// initialize page
-		const page = await this.browser.newPage();
+		const [page] = await browser.pages();
+		PuppeteerBlocker.fromPrebuiltAdsAndTracking(fetch).then((blocker) => {
+			blocker.enableBlockingInPage(page);
+		});
+
 		await page.setViewport({
 			width: 1600,
 			height: 1200,
@@ -61,24 +56,23 @@ class BrowserManager {
 
 					// get title
 					try {
-						response.title = (await page.$eval('#productTitle', (element) => element.innerHTML)).trim();
+						response.title = (await page.$eval('#productTitle', (element) => element.textContent)).trim();
 					} catch (e) {}
 
 					// get description
 					try {
-						response.description = (await page.$eval('#productDescription', (element) => element.innerHTML)).trim();
+						response.description = (await page.$eval('#productDescription', (element) => element.textContent)).trim();
 					} catch (e) {}
 
 					// get price
 					try {
-						response.price = (await page.$eval('.a-offscreen', (element) => element.innerHTML)).trim();
+						response.price = (await page.$eval('.a-offscreen', (element) => element.textContent)).trim();
 					} catch (e) {}
 
 					// get images
 					try {
 						let images = [];
-						const imageScriptElement = (await page.$x('//script[contains(., "ImageBlockATF")]/text()'))[0];
-						let imageScript = await page.evaluate((el) => el.textContent, imageScriptElement);
+						const imageScript = await (await page.$('::-p-xpath(//script[contains(., "ImageBlockATF")]/text())')).evaluate((el) => el.textContent);
 						const imageRegex = /\"large\":\"(https.*?\.jpg)\"/gm;
 						let m;
 						while ((m = imageRegex.exec(imageScript)) !== null) {
@@ -100,7 +94,9 @@ class BrowserManager {
 							} catch (e) {}
 						}
 						response.images = imagesBase64;
-					} catch (e) {}
+					} catch (e) {
+						console.log('Error getting amazon images.', e);
+					}
 
 					// get page screenshot
 					const screenshot = await page.screenshot({ encoding: 'base64' });
@@ -113,16 +109,28 @@ class BrowserManager {
 					});
 
 					// close page
-					await page.close();
+					await browser.close();
 
-					console.log(response);
+					console.log({
+						title: response.title,
+						description: response.description,
+						price: response.price,
+						images: response.images.length,
+					});
 					res.send(response);
 				} catch (error) {
+					await browser.close();
+
 					console.log(error);
 					res.status(400).send({ error: 'Product not found' });
 				}
 			} else {
 				try {
+					// generate random User Agent
+					const userAgent = new UserAgent({ deviceCategory: 'desktop' });
+					const randomUserAgent = userAgent.toString();
+					await page.setUserAgent(randomUserAgent);
+
 					await page.goto(url, {
 						waitUntil: 'domcontentloaded',
 					});
@@ -154,9 +162,32 @@ class BrowserManager {
 					// get item price
 					try {
 						const content = await page.$eval('body', (element) => {
-							return element.innerText;
+							return element.textContent;
 						});
-						response.price = /\$(\s+?)?\d+(.\d{1,2})/.exec(content)?.[0].replace('$ ', '$');
+
+						const getPrice = (content: string) => {
+							const regex = /\$(\s+?)?\d+(.\d{1,2})/gm;
+							let m;
+							while ((m = regex.exec(content)) !== null) {
+								// This is necessary to avoid infinite loops with zero-width matches
+								if (m.index === regex.lastIndex) {
+									regex.lastIndex++;
+								}
+
+								let groupIndex = 0;
+								for (const match of m) {
+									if (groupIndex === 0) {
+										const price = parseFloat(match.replace(/[^\d.]/g, ''));
+
+										if (price > 0) {
+											return match;
+										}
+									}
+									groupIndex++;
+								}
+							}
+						};
+						response.price = getPrice(content);
 					} catch (e) {}
 
 					// get first image
@@ -170,11 +201,22 @@ class BrowserManager {
 					try {
 						try {
 							const imgSrcs = [];
-							const imgs = await page.$x('//img[not(ancestor::header)]');
+							const imgs = await page.$$('::-p-xpath(//img[not(ancestor::header)])');
 							let index = 0;
 							for (let img of imgs) {
 								let src = String(await (await img.getProperty('src')).jsonValue());
-								if (src.trim().length > 0 && src.startsWith('http') && !src.includes('.svg') && !imgSrcs.includes(src)) {
+								const rect = await img.boundingBox();
+
+								const minImageSize = 120;
+								if (
+									rect && // check if image is too small
+									(rect.width > minImageSize || rect.height > minImageSize) &&
+									// check path is valid
+									src.trim().length > 0 &&
+									src.startsWith('http') &&
+									!src.includes('.svg') &&
+									!imgSrcs.includes(src)
+								) {
 									if (index > 10) break; // limit images to 10
 									imgSrcs.push(src);
 									index++;
@@ -182,7 +224,9 @@ class BrowserManager {
 							}
 
 							response.images = response.images.concat(imgSrcs);
-						} catch (e) {}
+						} catch (e) {
+							console.log('Error getting image URLs.', e);
+						}
 
 						// convert urls to base64 images
 						let imagesBase64 = [];
@@ -213,11 +257,13 @@ class BrowserManager {
 					});
 
 					// close page
-					await page.close();
+					await browser.close();
 
 					// console.log(response);
 					res.send(response);
 				} catch (error) {
+					await browser.close();
+
 					console.log(error);
 					res.status(400).send({ error: 'Product not found' });
 				}
@@ -236,15 +282,11 @@ app.use(bodyParser.json());
 
 app.post('/', async (req, res) => {
 	try {
-		if (browserManager.browser === undefined) {
-			res.status(500).send('Server initializing...');
+		const url = String(req.body.url).trim();
+		if (url.length > 0 && url.startsWith('http')) {
+			browserManager.enqueue(url, res);
 		} else {
-			const url = String(req.body.url).trim();
-			if (url.length > 0 && url.startsWith('http')) {
-				browserManager.enqueue(url, res);
-			} else {
-				res.status(400).send({ error: 'No url provided' });
-			}
+			res.status(400).send({ error: 'No url provided' });
 		}
 	} catch (error) {
 		res.status(500).send('ERROR! - ' + error.message);
@@ -253,34 +295,17 @@ app.post('/', async (req, res) => {
 
 app.get('/', async (req, res) => {
 	try {
-		if (browserManager.browser === undefined) {
-			res.status(500).send('Server initializing...');
-		} else {
-			res.send(UI);
-		}
+		res.send(UI);
 	} catch (error) {
 		res.status(500).send('ERROR! - ' + error.message);
 	}
 });
-
-// Display page count every 30 seconds
-getPageCount();
-setInterval(async () => getPageCount(), 30000);
 
 app.listen(port, () => {
 	return console.log(`Express is listening at http://localhost:${port}`);
 });
 
 const delay = (ms) => new Promise((res) => setTimeout(res, ms));
-
-async function getPageCount() {
-	if (browserManager.browser !== undefined) {
-		const pages = await browserManager.browser.pages();
-		console.log(`Active Pages: ${pages.filter((p) => p.url() !== 'about:blank').length}`);
-	} else {
-		console.log(`Active Pages: 0`);
-	}
-}
 
 async function autoScroll(page, maxScrolls) {
 	await page.evaluate(async (maxScrolls) => {
@@ -331,7 +356,7 @@ async function getImageAsBase64(imageUrl: string): Promise<string> {
 			const base64 = (await resizedImageBuf.toBuffer()).toString('base64');
 			resolve(`data:image/jpg;base64,${base64}`);
 		} catch (error) {
-			console.log(`Error: ${imageUrl}`, error);
+			console.log(`Error converting image to base64: ${imageUrl}`, error);
 			reject(error);
 		}
 	});
