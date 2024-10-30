@@ -25,7 +25,7 @@ class BrowserManager {
 		console.log('Load images for... ' + url);
 
 		const browser = await puppeteer.launch({
-			// headless: false,
+			headless: true,
 			args: ['--no-sandbox', '--disable-setuid-sandbox', '--window-size=1600,1200'],
 		});
 		console.log('Browser launched');
@@ -40,6 +40,11 @@ class BrowserManager {
 			width: 1600,
 			height: 1200,
 		});
+
+		// generate random User Agent
+		const userAgent = new UserAgent({ deviceCategory: 'desktop' });
+		const randomUserAgent = userAgent.toString();
+		await page.setUserAgent(randomUserAgent);
 
 		if (this.urlQueue.length > 0) {
 			const url = this.urlQueue.shift();
@@ -126,11 +131,6 @@ class BrowserManager {
 				}
 			} else {
 				try {
-					// generate random User Agent
-					const userAgent = new UserAgent({ deviceCategory: 'desktop' });
-					const randomUserAgent = userAgent.toString();
-					await page.setUserAgent(randomUserAgent);
-
 					await page.goto(url, {
 						waitUntil: 'domcontentloaded',
 					});
