@@ -1,12 +1,16 @@
 import express, { Response } from 'express';
 import bodyParser from 'body-parser';
 
+import { Browser, Page } from 'puppeteer';
 import puppeteer from 'puppeteer-extra';
 import createPuppeteerStealth from 'puppeteer-extra-plugin-stealth';
 import { PuppeteerBlocker } from '@ghostery/adblocker-puppeteer';
 import fetch from 'cross-fetch'; // required for PuppeteerBlocker
 
 import UserAgent from 'user-agents';
+
+import fs from 'fs';
+import path from 'path';
 
 import axios from 'axios';
 import sharp from 'sharp';
@@ -16,19 +20,46 @@ const puppeteerStealth = createPuppeteerStealth();
 puppeteerStealth.enabledEvasions.delete('user-agent-override');
 puppeteer.use(puppeteerStealth);
 
+require('dotenv').config();
+const configPath = process.env.HOME_OVERRIDE ? process.env.HOME_OVERRIDE : process.env.HOME ? path.join(String(process.env.HOME)) : './config';
+if (!fs.existsSync(configPath)) {
+	console.log('Creating config folder...', configPath);
+	fs.mkdirSync(configPath);
+}
+
+const errorsPath = path.join(configPath, 'errors');
+if (!fs.existsSync(errorsPath)) {
+	console.log('Creating errors folder...', errorsPath);
+	fs.mkdirSync(errorsPath, { recursive: true });
+}
+
 class BrowserManager {
 	urlQueue: string[] = [];
+
+	async captureSnapshot(page: Page) {
+		const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+
+		// get page snapshot
+		const cdp = await page.target().createCDPSession();
+		const { data: pageSnapshot } = await cdp.send('Page.captureSnapshot', { format: 'mhtml' });
+		fs.writeFileSync(path.join(errorsPath, `${timestamp}-snapshot.mhtml`), pageSnapshot);
+
+		// get page screenshot
+		await page.screenshot({ path: path.join(errorsPath, `${timestamp}-screenshot.png`), encoding: 'base64' });
+	}
 
 	async enqueue(url: string, res: Response) {
 		this.urlQueue.push(url);
 
-		console.log('Load images for... ' + url);
-
 		const browser = await puppeteer.launch({
+			executablePath: undefined,
+			targetFilter: (target: any) => target.type() !== 'other',
+			args: ['--window-size=1600,1200', '--no-sandbox', '--disable-setuid-sandbox', '--font-render-hinting=none'],
 			headless: true,
-			args: ['--no-sandbox', '--disable-setuid-sandbox', '--window-size=1600,1200'],
 		});
 		console.log('Browser launched');
+
+		console.log('Load images for... ' + url);
 
 		// initialize page
 		const [page] = await browser.pages();
@@ -36,15 +67,7 @@ class BrowserManager {
 			blocker.enableBlockingInPage(page);
 		});
 
-		await page.setViewport({
-			width: 1600,
-			height: 1200,
-		});
-
-		// generate random User Agent
-		const userAgent = new UserAgent({ deviceCategory: 'desktop' });
-		const randomUserAgent = userAgent.toString();
-		await page.setUserAgent(randomUserAgent);
+		await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36');
 
 		if (this.urlQueue.length > 0) {
 			const url = this.urlQueue.shift();
@@ -56,65 +79,12 @@ class BrowserManager {
 			// if amazon link
 			if (url.startsWith('https://www.amazon.com') || url.startsWith('https://amazon.com') || url.startsWith('https://a.co') || url.startsWith('https://amzn.to')) {
 				try {
-					await page.goto(url);
-					await page.waitForSelector('#productTitle', { timeout: 5000 });
+					const cloudflareAmazonWorker = (await axios.get(`https://giftamizer-amazon.explodedcode.workers.dev`, { params: { url: url } })).data;
 
-					// get title
-					try {
-						response.title = (await page.$eval('#productTitle', (element) => element.textContent)).trim();
-					} catch (e) {}
-
-					// get description
-					try {
-						response.description = (await page.$eval('#productDescription', (element) => element.textContent)).trim();
-					} catch (e) {}
-
-					// get price
-					try {
-						response.price = (await page.$eval('.a-offscreen', (element) => element.textContent)).trim();
-					} catch (e) {}
-
-					// get images
-					try {
-						let images = [];
-						const imageScript = await (await page.$('::-p-xpath(//script[contains(., "ImageBlockATF")]/text())')).evaluate((el) => el.textContent);
-						const imageRegex = /\"large\":\"(https.*?\.jpg)\"/gm;
-						let m;
-						while ((m = imageRegex.exec(imageScript)) !== null) {
-							if (m.index === imageRegex.lastIndex) imageRegex.lastIndex++;
-							m.forEach((match, groupIndex) => {
-								if (groupIndex === 1) {
-									images.push(match);
-								}
-							});
-						}
-						response.images = images;
-
-						// convert urls to base64 images
-						let imagesBase64 = [];
-						for (let index = 0; index < response.images.length; index++) {
-							const img = response.images[index];
-							try {
-								imagesBase64.push(await getImageAsBase64(img));
-							} catch (e) {}
-						}
-						response.images = imagesBase64;
-					} catch (e) {
-						console.log('Error getting amazon images.', e);
-					}
-
-					// get page screenshot
-					const screenshot = await page.screenshot({ encoding: 'base64' });
-					response.images = response.images.slice(0, 10); // top 10 images
-					response.images = response.images.concat('data:image/jpeg;base64,' + screenshot);
-
-					// remove duplicates
-					response.images = response.images.filter(function (item: any, pos: number) {
-						return response.images?.indexOf(item) == pos;
-					});
-
-					// close page
-					await browser.close();
+					response.title = cloudflareAmazonWorker.title;
+					response.description = cloudflareAmazonWorker.description;
+					response.price = cloudflareAmazonWorker.price;
+					response.images = cloudflareAmazonWorker.images;
 
 					console.log({
 						title: response.title,
@@ -122,6 +92,19 @@ class BrowserManager {
 						price: response.price,
 						images: response.images.length,
 					});
+
+					// convert urls to base64 images
+					let imagesBase64 = [];
+					for (let index = 0; index < response.images.length; index++) {
+						const img = response.images[index];
+						try {
+							imagesBase64.push(await getImageAsBase64(img));
+						} catch (e) {}
+					}
+					response.images = imagesBase64;
+
+					await browser.close();
+
 					res.send(response);
 				} catch (error) {
 					await browser.close();
@@ -131,9 +114,12 @@ class BrowserManager {
 				}
 			} else {
 				try {
-					await page.goto(url, {
-						waitUntil: 'domcontentloaded',
-					});
+					try {
+						await page.goto(url, {
+							waitUntil: 'networkidle0',
+							timeout: 5000,
+						});
+					} catch {}
 
 					await delay(1000); // wait for 1000ms
 
@@ -257,12 +243,13 @@ class BrowserManager {
 					});
 
 					// close page
-					await browser.close();
+					await page.close();
 
 					// console.log(response);
 					res.send(response);
 				} catch (error) {
-					await browser.close();
+					await this.captureSnapshot(page);
+					await page.close();
 
 					console.log(error);
 					res.status(400).send({ error: 'Product not found' });
@@ -275,7 +262,7 @@ class BrowserManager {
 const browserManager = new BrowserManager();
 
 const app = express();
-const port = 5500;
+const port = 5501;
 
 // Body Parser Middleware
 app.use(bodyParser.json());
@@ -296,6 +283,51 @@ app.post('/', async (req, res) => {
 app.get('/', async (req, res) => {
 	try {
 		res.send(UI);
+	} catch (error) {
+		res.status(500).send('ERROR! - ' + error.message);
+	}
+});
+
+app.get('/errors', async (req, res) => {
+	try {
+		const files = await fs.promises.readdir(path.join(__dirname, 'errors'));
+
+		// Delete files older than 2 weeks
+		const twoWeeksAgo = new Date();
+		twoWeeksAgo.setDate(twoWeeksAgo.getDate() - 14);
+
+		for (const file of files) {
+			const filePath = path.join(__dirname, 'errors', file);
+			const stats = await fs.promises.stat(filePath);
+
+			if (stats.mtime < twoWeeksAgo) {
+				await fs.promises.unlink(filePath);
+			}
+		}
+
+		// Get updated file list after deletions
+		const errorFiles = await fs.promises.readdir(path.join(__dirname, 'errors'));
+
+		const html = `
+                        <html>
+                                <body>
+                                        <h1>Error Screenshots</h1>
+                                        <ul>
+                                                ${errorFiles.map((file) => `<li><a href="/errors/${file}">${file}</a></li>`).join('')}
+                                        </ul>
+                                </body>
+                        </html>
+                `;
+		res.send(html);
+	} catch (error) {
+		res.status(500).send('ERROR! - ' + error.message);
+	}
+});
+
+app.get('/errors/:filename', async (req, res) => {
+	try {
+		const filename = req.params.filename;
+		res.sendFile(`${__dirname}/errors/${filename}`);
 	} catch (error) {
 		res.status(500).send('ERROR! - ' + error.message);
 	}
@@ -329,6 +361,7 @@ async function autoScroll(page, maxScrolls) {
 	}, maxScrolls); // pass maxScrolls to the function
 }
 
+const imageSize = 1000;
 async function getImageAsBase64(imageUrl: string): Promise<string> {
 	return new Promise(async (resolve, reject) => {
 		try {
@@ -342,18 +375,35 @@ async function getImageAsBase64(imageUrl: string): Promise<string> {
 				},
 			});
 
-			// load image and remove transparency
-			let resizedImageBuf = await sharp(response.data);
-			resizedImageBuf = await resizedImageBuf.flatten({ background: { r: 255, g: 255, b: 255 } });
+			// Create base blurred background
+			const background = sharp(response.data)
+				.resize(imageSize, imageSize, {
+					fit: 'cover',
+					position: 'center',
+				})
+				.blur(30); // Optionally add a blur to the background for effect.
 
-			// resize if larger than 1000px in any direction
-			const metadata = await resizedImageBuf.metadata();
-			if (metadata.height > 1000 || metadata.width > 1000) {
-				resizedImageBuf = resizedImageBuf.resize(1000);
-			}
+			// Create the overlay image by resizing to fit within 1000x1000 and keeping aspect ratio
+			const overlay = sharp(response.data).resize(imageSize, imageSize, {
+				fit: 'inside',
+				position: 'center',
+			});
+
+			// Composite the images
+			const compositeImage = await sharp({
+				create: {
+					width: imageSize,
+					height: imageSize,
+					channels: 4,
+					background: { r: 0, g: 0, b: 0, alpha: 1 }, // Black transparent background
+				},
+			})
+				.composite([{ input: await background.toBuffer() }, { input: await overlay.toBuffer(), blend: 'over' }])
+				.jpeg()
+				.toBuffer();
 
 			// convert to base64
-			const base64 = (await resizedImageBuf.toBuffer()).toString('base64');
+			const base64 = compositeImage.toString('base64');
 			resolve(`data:image/jpg;base64,${base64}`);
 		} catch (error) {
 			console.log(`Error converting image to base64: ${imageUrl}`, error);
